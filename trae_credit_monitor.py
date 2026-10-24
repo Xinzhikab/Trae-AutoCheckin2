@@ -176,13 +176,19 @@ def persist_refresh_token(uid, new_rt, seed_rt):
             return
 
 
-def get_token(idx, rt_env, did_env, cache, force_refresh=False):
+def get_token(idx, rt_env, did_env, cache, force_refresh=False, at_env=''):
     key = str(idx)
     did = did_env or stable_device_id(rt_env)
     ent = cache.get(key) or {}
     at = ent.get('accessToken')
     rt_cache = ent.get('refreshToken')
     exp = ent.get('expiresAt') or 0
+    # Actions 每次都是全新环境、没有缓存文件；TRAE_ACCOUNTS 里带了未过期的
+    # accessToken 时直接复用，避免每次都用 refreshToken 续期。
+    if not at and at_env and not force_refresh:
+        real_exp = _jwt_exp(at_env)
+        if real_exp and real_exp - 60 > time.time():
+            at, exp = at_env, real_exp
     if at and not force_refresh:
         if exp and exp - 60 > time.time():
             return at, did, (rt_cache or rt_env), None
@@ -273,7 +279,8 @@ def load_accounts():
             label = a.get('name') or a.get('uid') or '账号%d' % idx
             if only and only not in (str(idx), str(a.get('uid', '')), label):
                 continue
-            accounts.append((idx, rt, a.get('deviceId', '').strip(), label))
+            at = a.get('accessToken', '').strip()
+            accounts.append((idx, rt, a.get('deviceId', '').strip(), label, at))
         if accounts:
             return accounts
     only = os.environ.get('TRAE_ONLY', '').strip()
@@ -284,16 +291,17 @@ def load_accounts():
         if not rt:
             continue
         did = os.environ.get('TRAE_DEVICE_ID' if i == 1 else 'TRAE_DEVICE_ID_%d' % i, '').strip()
+        at = os.environ.get('TRAE_ACCESS_TOKEN' if i == 1 else 'TRAE_ACCESS_TOKEN_%d' % i, '').strip()
         label = '账号%d' % i
         if only and only not in (str(i), label):
             continue
-        accounts.append((i, rt, did, label))
+        accounts.append((i, rt, did, label, at))
     return accounts
 
 
 def iter_accts():
-    for idx, rt, did, label in load_accounts():
-        yield idx, rt, did, label
+    for idx, rt, did, label, at in load_accounts():
+        yield idx, rt, did, label, at
 
 
 def main():
@@ -309,9 +317,9 @@ def main():
     cache = load_cache()
     ok, fail = [], []
     out = ['📊 Trae 积分监控', '🕒 ' + bj()]
-    for i, (idx, rt, did, label) in enumerate(accts):
+    for i, (idx, rt, did, label, at_env) in enumerate(accts):
         name = label if label else '账号%d' % idx
-        token, did, new_rt, err = get_token(idx, rt, did, cache)
+        token, did, new_rt, err = get_token(idx, rt, did, cache, at_env=at_env)
         if not token:
             print('❌ [%s] 凭证续期失败: %s' % (name, err))
             fail.append(name + ' 凭证续期失败'); out.append('❌ %s：凭证续期失败' % name); continue
