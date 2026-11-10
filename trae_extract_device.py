@@ -160,18 +160,24 @@ def extract(path):
 
 def main():
     # 默认只打印一行 JSON（窗口不滚动、不丢结果）；
-    # --verbose 才打印来源/账号/DeviceID 等详情。
+    # --verbose 才打印来源/账号/DeviceID 等详情。无论成败都写结果文件，
+    # 让 .bat 能自动弹记事本，里面要么是 JSON、要么是明确原因。
     verbose = "--verbose" in sys.argv
     found = False
     last = None
-    for p in candidate_storage_paths():
+    paths = list(candidate_storage_paths())
+    problems = []
+    for p in paths:
         try:
             r = extract(p)
         except Exception as e:
+            problems.append("解析失败 %s: %s" % (p, e))
             if verbose:
                 print("[!] 解析失败 %s: %s" % (p, e))
             continue
         if not r.get("deviceId"):
+            problems.append("%s 该机器还没有在 Trae 服务端登记过设备（无 icube-dc:* 键）。"
+                            % p + " 先启动一次 Trae 客户端再重跑。")
             if verbose:
                 print("[%s] 该机器还没有在 Trae 服务端登记过设备（无 icube-dc:* 键）。"
                       % p + " 先启动一次 Trae 客户端再重跑。")
@@ -189,16 +195,30 @@ def main():
             print("=" * 64)
     if found and last:
         print(json.dumps(last, ensure_ascii=False))
-        # 双保险：同时写一份到同目录文件，超长 JSON 也能完整拿到
         try:
             with open(RESULT_FILE, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(last, ensure_ascii=False) + "\n")
             print("\n[已另存] %s" % RESULT_FILE)
         except Exception as e:
             print("\n[!] 结果写入文件失败: %s" % e)
-    elif not found:
-        print("[X] 没找到任何带设备登记的 storage.json。")
-        print("    请先在这台机器上启动一次 Trae 客户端（不用登录）再运行本脚本。")
+    else:
+        # 没找到：把原因写进同文件，.bat 照常弹记事本，室友能直接看到指引
+        reason = []
+        if not paths:
+            reason.append("没找到任何 storage.json。")
+            reason.append("可能没装 Trae 客户端，或装了但没启动过一次。")
+            reason.append("请安装 Trae 并打开登录一次，再重跑本脚本。")
+        else:
+            reason.append("没找到带设备登记的 Trae 凭据（共检查 %d 个路径）：" % len(paths))
+            reason.extend("  " + x for x in problems)
+            reason.append("")
+            reason.append("请先：安装 Trae 客户端 → 打开并登录一次 → 再重跑本脚本。")
+        try:
+            with open(RESULT_FILE, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(reason) + "\n")
+        except Exception as e:
+            reason.append("[!] 无法写结果文件: %s" % e)
+        print("[X] " + " ".join(reason))
         return 1
     return 0
 
