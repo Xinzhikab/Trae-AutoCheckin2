@@ -21,10 +21,20 @@ goto :done
 
 :done
 echo.
+if exist "%~dp0trae_device_result.json" (
+    echo Result saved to trae_device_result.json.
+    echo Opening it in Notepad now - copy the whole line inside.
+    echo.
+    start "" notepad "%~dp0trae_device_result.json"
+) else (
+    echo No result file was created. Check the line above starting with {,
+    echo or run again after starting Trae client once.
+)
+echo.
 echo --------------------------------------------
-echo The line above (starting with { ) is the full
-echo result. Copy that whole line, send it privately.
+echo The result is the ONE line that starts with { .
 echo It contains the ECDSA private key - keep it
 echo PRIVATE, never paste into public chats/repos.
+echo Copy it, send it privately.
 echo --------------------------------------------
 pause
