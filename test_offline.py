@@ -93,6 +93,28 @@ def test_build_account_refresh_only():
         raise AssertionError('缺凭据的账号应当报错')
 
 
+def test_extract_parses_json_blob():
+    """storage.json 解密后是 JSON（尾部带填充残留），必须连 accessToken 一起解出来。
+    只给 refreshToken 续期会被服务端拒成 10101，所以提取器得给全。"""
+    import trae_get_token as gt
+    import tempfile
+
+    # 造一份真实的加密凭据：自加密不可行（只有解密），所以直接验证解析层
+    blob = ('{"token":"AT","refreshToken":"RT","userId":"1430910469149417",'
+            '"expiredAt":"2026-11-19T08:44:42.962Z",'
+            '"account":{"username":"略略略"}}')
+    txt = blob + "\x00\x00\x00"            # 模拟尾部填充残留
+    try:
+        d, _ = json.JSONDecoder().raw_decode(txt)
+    except ValueError:
+        raise AssertionError('raw_decode 必须能吃掉尾部残留')
+    assert d['token'] == 'AT' and d['account']['username'] == '略略略'
+
+    assert gt.at_valid('2099-01-01T00:00:00.000Z') is True
+    assert gt.at_valid('2020-01-01T00:00:00.000Z') is False
+    assert gt.at_valid('') is False
+
+
 if __name__ == '__main__':
     n = 0
     for name, fn in sorted(globals().items()):

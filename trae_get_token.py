@@ -9,20 +9,25 @@ Trae Token 提取器 · trae_get_token.py
 ✨ 特性
   • 零依赖     纯标准库，无需 pip install
   • 免抓包     直接读客户端 storage.json 并自动解密
-  • 一键输出   直接打印 refreshToken，复制进青龙环境变量即可
+  • 一键输出   直接给出可粘贴的 TRAE_ACCOUNTS（含 accessToken，省一次续期）
   • 自动找路径 自动探测 Trae CN / TRAE SOLO 等常见目录
 
 🚀 使用方法
   1. 打开 Trae 客户端并登录一次（确保已产生凭据）
   2. 运行：python trae_get_token.py
-  3. 复制输出的 TRAE_REFRESH_TOKEN 值，填入青龙面板环境变量
+  3. 复制输出的 TRAE_ACCOUNTS 整串，填进青龙面板 / Actions secret
+
+⚠️ 为什么优先用 TRAE_ACCOUNTS 而不是单给 refreshToken
+  refreshToken 续期绑定客户端标识，只拿这一串去 ExchangeToken 会被服务端
+  拒成 10101「refresh token is not matched to the client」。带上 accessToken
+  就能直接复用（约 14 天有效），过期后才需要续期，而那时本脚本会给出新的一对。
 
 📌 说明
   • 只读取本机自己的客户端凭据，不联网、不上传，安全无风险。
   • 多账号：在客户端依次登录每个账号并各运行一次本脚本即可。
 ────────────────────────────────────────────────────────────
 """
-import base64, hashlib, json, os, sys, re
+import base64, datetime, hashlib, json, os, sys, re
 
 # ── 让 Windows 控制台也能正常打印 emoji ──
 try:
@@ -135,34 +140,80 @@ def extract(path):
     enc = s.get(STORAGE_KEY)
     if not enc: return None
     txt = decrypt_storage_value(enc).decode("utf-8", "replace")
-    rt = re.search(r'"refreshToken"\s*:\s*"([^"]+)"', txt)
-    at = re.search(r'"token"\s*:\s*"([^"]+)"', txt)
-    uid = re.search(r'"userId"\s*:\s*"(\d+)"', txt)
-    nick = re.search(r'"username"\s*:\s*"([^"]*)"', txt)
-    return {"refreshToken": rt.group(1) if rt else None,
-            "accessToken": at.group(1) if at else None,
-            "uid": uid.group(1) if uid else None,
-            "nickname": nick.group(1) if nick else None}
+    # 解密结果尾部常带填充残留，raw_decode 只取第一个完整 JSON 对象
+    try:
+        d, _ = json.JSONDecoder().raw_decode(txt)
+    except ValueError:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    acct = d.get("account") or {}
+
+    def pick(key):
+        return d.get(key) or acct.get(key) or ""
+
+    # 老格式（无 JSON 结构）回退到正则
+    rt = pick("refreshToken") or (re.search(r'"refreshToken"\s*:\s*"([^"]+)"', txt) or [None, None])[1]
+    at = pick("token") or (re.search(r'"token"\s*:\s*"([^"]+)"', txt) or [None, None])[1]
+    uid = str(pick("userId") or (re.search(r'"userId"\s*:\s*"(\d+)"', txt) or [None, ""])[1] or "")
+    nick = pick("username")
+    return {"refreshToken": rt,
+            "accessToken": at,
+            "uid": uid,
+            "nickname": nick,
+            "expiredAt": d.get("expiredAt") or "",
+            "refreshExpiredAt": d.get("refreshExpiredAt") or ""}
+
+
+def at_valid(expired_at):
+    """accessToken 是否还没过期（expiredAt 是 UTC ISO8601）。"""
+    try:
+        t = datetime.datetime.strptime(expired_at.replace("Z", ""), "%Y-%m-%dT%H:%M:%S.%f")
+    except Exception:
+        try:
+            t = datetime.datetime.strptime(expired_at.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return False
+    return t - datetime.timedelta(minutes=1) > datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
 
 def main():
     found = False
+    accts = []
     for p in candidate_paths():
         try:
             r = extract(p)
         except Exception as e:
             print("[!] 解析失败 %s: %s" % (p, e)); continue
-        if not r or not r.get("refreshToken"): continue
+        if not r or not (r.get("refreshToken") or r.get("accessToken")): continue
         found = True
         print("=" * 64)
         print("[来源] %s" % p)
         if r.get("uid"):
             print("[账号] %s (UID %s)" % (r.get("nickname") or "-", r["uid"]))
+        if r.get("expiredAt"):
+            live = at_valid(r["expiredAt"])
+            print("[accessToken] %s，到期 %s" % ("✅ 未过期" if live else "⌛ 已过期", r["expiredAt"]))
         print("-" * 64)
-        print("TRAE_REFRESH_TOKEN = %s" % r["refreshToken"])
+        # 推荐写法：整串 TRAE_ACCOUNTS 直接粘进青龙/Actions，accessToken 一起给，
+        # 省掉一次续期。只有 refreshToken 时续期会因"未绑定客户端"被拒（10101）。
+        one = {k: v for k, v in (("name", r.get("nickname")), ("uid", r.get("uid")),
+                                 ("accessToken", r.get("accessToken")),
+                                 ("refreshToken", r.get("refreshToken"))) if v}
+        accts.append(one)
+        print("TRAE_ACCOUNTS（推荐，含 accessToken，省一次续期）:")
+        print(json.dumps([one], ensure_ascii=False))
+        print("-" * 64)
+        print("TRAE_REFRESH_TOKEN（旧写法，仅 refreshToken）:")
+        print("TRAE_REFRESH_TOKEN = %s" % r.get("refreshToken"))
         print("=" * 64)
     if not found:
         print("[X] 没找到可用的 refreshToken。")
         print("    请先打开 Trae 客户端并登录一次，再运行本脚本。")
+        return
+    if len(accts) > 1:
+        print("\n多账号合并写法（一次粘进 TRAE_ACCOUNTS）:")
+        print(json.dumps(accts, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()

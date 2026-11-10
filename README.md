@@ -60,18 +60,23 @@
 # 2. 运行提取脚本
 python trae_get_token.py
 
-# 3. 终端会打印出（直接复制等号后面的那串）：
-#    TRAE_REFRESH_TOKEN = AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD=.0000000000000000
+# 3. 终端会打印出可直接粘贴的 TRAE_ACCOUNTS（含 accessToken）：
+#    [{"name":"你的昵称","uid":"1430910...","accessToken":"eyJhbGci...","refreshToken":"7fjfDD..."}]
+#    以及旧写法：TRAE_REFRESH_TOKEN = 7fjfDDuVm_O3T81so0DgN0ia2oqja0wWweC1WuV8ZMI=.18e519b2f56a201f
 ```
 
 复制到青龙面板 **环境变量** → 新建变量：
 
 | 变量名 | 值 |
 | :--- | :--- |
-| `TRAE_REFRESH_TOKEN` | 粘贴上面复制的那串 |
+| `TRAE_ACCOUNTS` | 粘贴整个 `[...]` JSON 数组（**推荐**） |
+
+> ⚠️ **别只填 `TRAE_REFRESH_TOKEN`**：refreshToken 续期绑定客户端标识，只拿这一串去换
+> token 会被服务端拒成 `10101 refresh token is not matched to the client`。
+> 带上 `accessToken`（约 14 天有效）就能直接复用、省掉续期；过期后重跑本脚本取新的一对。
 
 **多账号**：在客户端依次登录每个账号，各运行一次 `trae_get_token.py`，
-把得到的值分别填到 `TRAE_REFRESH_TOKEN`、`TRAE_REFRESH_TOKEN_2`、`TRAE_REFRESH_TOKEN_3` …
+把每次输出的那个 `{...}` 对象都塞进同一个 `TRAE_ACCOUNTS` 数组即可（脚本末尾也会打印合并版）。
 
 ### 🔍 方式二：手动定位（了解原理可选）
 
