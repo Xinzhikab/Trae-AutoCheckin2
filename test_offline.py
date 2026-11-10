@@ -115,6 +115,38 @@ def test_extract_parses_json_blob():
     assert gt.at_valid('') is False
 
 
+def test_real_device_id_wins_and_never_rotates():
+    """9074 的根因是设备号不被服务端认可，不是限流（2026-11 实测）。
+    真机号必须优先、且 9074 后绝不轮换成合成号，否则越换越签不上。"""
+    import trae_get_token as gt
+    st = {'iCubeAuthInfo://icube-dc:2803108645440825': 'x',
+          'iCubeAuthInfo://icube.cloudide': 'y'}
+    assert gt.real_device_id(st) == '2803108645440825'
+    assert gt.real_device_id({}) == ''
+
+    # 真机号优先于持久化/合成号
+    real = {'_name': '主号', '_realDid': '2803108645440825', 'deviceId': ''}
+    assert ci.device_id_for(real, '') == '2803108645440825'
+
+    # 9074 后不轮换真机号
+    real['deviceId'] = '2803108645440825'
+    assert ci.rotate_device_id(real) == '2803108645440825'
+
+    # 手工填的 deviceId 同样钉住
+    pinned = {'_name': '手填', 'deviceId': '1234567890123456'}
+    ci.device_id_for(pinned, '1234567890123456')
+    assert ci.rotate_device_id(pinned) == '1234567890123456'
+
+
+def test_status_flags():
+    """did_checked_in 是设备维度，checked_in 是账号维度，两者都要能读到。"""
+    body = json.dumps({'checked_in': False, 'did_checked_in': True, 'credits': 100,
+                       'enable': True, 'code': 0})
+    ci._post = lambda *a, **k: (200, body)
+    checked_in, credits, enable, code, raw, did = ci.status_of('t', '2803108645440825')
+    assert (checked_in, did, credits, enable) == (False, True, 100, True)
+
+
 if __name__ == '__main__':
     n = 0
     for name, fn in sorted(globals().items()):

@@ -552,15 +552,24 @@ def save_device_ids(ids):
 
 
 def rotate_device_id(acc):
-    """9074 反复出现时换一个全新设备号：旧号会被服务端记住（越戳越黑），
-    实测换个新号立刻就能签成。新号按时间生成，保证与旧号不同并写回设备号文件。"""
+    """9074 后换设备号 —— 仅当手头没有真机号时的最后手段。
+
+    ⚠️ 实测结论（2026-11）：9074 的根因是设备号不被服务端认可，不是限流。
+    合成号一律 9074，换多少个都签不上；而真机号会直接给出 9095「当前设备
+    今日已经签到」或签成。所以有真机号时绝不轮换 —— 把唯一能用的号换掉，
+    等于自断后路（这正是之前"越换越签不上"的原因）。"""
+    real = str(acc.get('_realDid') or '').strip()
+    if acc.get('_didPinned') or (real.isdigit() and len(real) == 16):
+        keep = acc.get('deviceId') or real
+        print('🚫 [设备号] 9074 但 %s 是真机号，不轮换（合成号签不上）' % keep)
+        return keep
     key = _acct_key(acc)
     ids = load_device_ids()
     new_id = stable_device_id('%s:rotate:%d' % (key, int(time.time())))
     ids[key] = new_id
     save_device_ids(ids)
     acc['deviceId'] = new_id
-    print('🔄 [设备号] %s 换新设备号 %s（旧号已被服务端记住）'
+    print('🔄 [设备号] %s 换新设备号 %s（无真机号，只能试合成号）'
           % (acc.get('_name') or acc.get('name') or key, new_id))
     return new_id
 
@@ -571,6 +580,7 @@ def device_id_for(acc, manual=''):
     每次续期都会变，导致设备号每轮都换、凭据文件无限增长 —— 对风控而言
     "设备不停更换"本身就是高危信号。"""
     if manual and manual.isdigit() and len(manual) == 16:
+        acc['_didPinned'] = True      # 手工指定的号不许被 9074 轮换掉
         return manual
     real = str(acc.get('_realDid') or '').strip()
     if real.isdigit() and len(real) == 16:
@@ -578,10 +588,15 @@ def device_id_for(acc, manual=''):
     seed = _acct_key(acc)
     ids = load_device_ids()
     if seed in ids:
+        print('⚠️  [设备号] %s 没有真机号，用的是合成号 %s —— 服务端不认，大概率 9074'
+              % (acc.get('_name') or acc.get('name') or seed, ids[seed]))
         return ids[seed]
     new_id = stable_device_id(seed)
     ids[seed] = new_id
     save_device_ids(ids)
+    print('⚠️  [设备号] %s 没有真机号，生成合成号 %s —— 服务端不认，大概率 9074。'
+          '请跑 trae_get_token.py 取回该账号客户端的 deviceId 后写进 TRAE_ACCOUNTS'
+          % (acc.get('_name') or acc.get('name') or seed, new_id))
     return new_id
 
 
@@ -750,17 +765,22 @@ def load_accounts():
 
 # ══════════════════ 签到接口 ══════════════════
 def status_of(token, device_id):
-    """返回 (checked_in, credits, enable, code, raw)；查询不通时前三项为 None。
-    请求体必须带 req_source（客户端同款），空体会被服务端拒成 9074。"""
+    """返回 (checked_in, credits, enable, code, raw, did_checked_in)；查询不通时前三项为 None。
+    请求体必须带 req_source（客户端同款），空体会被服务端拒成 9074。
+
+    注意 did_checked_in 是"当前设备号今天签没签"：真实设备号下它会是 true，
+    而 checked_in（账号维度）仍可能是 false —— 两者要一起看，否则会拿合成号
+    反复 claim 换回一堆 9074。"""
     status, text = _post(EP_STATUS, ug_headers(token, device_id), REQ_BODY)
     try:
         d = json.loads(text)
     except Exception:
-        return None, None, None, -1, text
+        return None, None, None, -1, text, False
     code = d.get('code', -1)
     if status >= 400:
-        return None, None, None, code, text
-    return (bool(d.get('checked_in', False)), d.get('credits', 0), d.get('enable', False), code, text)
+        return None, None, None, code, text, False
+    return (bool(d.get('checked_in', False)), d.get('credits', 0), d.get('enable', False), code, text,
+            bool(d.get('did_checked_in', False)))
 
 
 def claim(token, device_id):
@@ -909,16 +929,17 @@ def checkin_account(acc, cache):
     print('📱 [设备号] %s: %s' % (name, acc['deviceId']))
     log_head('📡 %s 签到状态查询' % name)
 
-    checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['deviceId'])
+    checked_in, credits, enable, code, raw, did_checked = status_of(acc['accessToken'], acc['deviceId'])
     if code in AUTH_FAIL_CODES and acc.get('refreshToken'):
         print('🔑 [刷新] 检测到 code=%s 鉴权失败，尝试刷新 token ...' % code)
         ok, msg = ensure_token(acc, cache)
         if ok:
             print('✅ [刷新] token 已更新')
-            checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['deviceId'])
+            checked_in, credits, enable, code, raw, did_checked = status_of(acc['accessToken'], acc['deviceId'])
         else:
             print('❌ [刷新] 失败: %s' % msg)
-    print('📊 [状态] 今日已签: %s   积分: %s   开放: %s' % (checked_in, credits, enable))
+    print('📊 [状态] 今日已签: %s   本设备今日已签: %s   积分: %s   开放: %s'
+          % (checked_in, did_checked, credits, enable))
 
     if checked_in:
         pts = credits_summary(acc)
@@ -928,6 +949,15 @@ def checkin_account(acc, cache):
         result['detail'] = ('今日已签，积分余额 %s' % _fmt(result['credits'])) if pts is not None \
             else '今日已签，积分 %s' % credits
         print('☑️  [结果] 今日已签到')
+        return result
+    # 设备维度已签：服务端按设备判重，这台设备今天已经签过某个账号了。
+    # 再发 claim 只会拿回 9095，直接按已签收工。
+    if did_checked:
+        result['icon'] = '☑️'
+        result['status'] = '已签到'
+        result['credits'] = credits
+        result['detail'] = '本设备今日已签到（did_checked_in=true），明日再来'
+        print('☑️  [结果] 本设备今日已签到')
         return result
     # 状态查询拿到鉴权失败（刷新后仍 1001）→ 硬失败，绝不浪费 claim 请求
     if code in AUTH_FAIL_CODES:
@@ -969,7 +999,7 @@ def checkin_account(acc, cache):
             result['credits'] = pts
             result['detail'] = '签到成功%s，当前余额 %s' % (gain, _fmt(pts))
         else:
-            _, credits_after, _, _, _ = status_of(acc['accessToken'], acc['deviceId'])
+            _, credits_after, _, _, _, _ = status_of(acc['accessToken'], acc['deviceId'])
             result['credits'] = credits_after if credits_after is not None else credits
             result['detail'] = '签到成功（code=0），积分 %s → %s' % (credits, _fmt(result['credits']))
         print('🎉 [结果] 签到成功')

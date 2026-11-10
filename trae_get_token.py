@@ -161,8 +161,24 @@ def extract(path):
             "accessToken": at,
             "uid": uid,
             "nickname": nick,
+            "deviceId": real_device_id(s),
             "expiredAt": d.get("expiredAt") or "",
             "refreshExpiredAt": d.get("refreshExpiredAt") or ""}
+
+
+def real_device_id(storage):
+    """取客户端真实设备号：storage.json 里 iCubeAuthInfo://icube-dc:<数字> 键。
+
+    ⚠️ 这是签到的硬门槛。服务端按设备维度判重（claim 返回 9095
+    「当前设备今日已经签到」），合成出来的 16 位数字会被判成不合格设备，
+    一律回 9074「参与用户太多」—— 看起来像限流，实际是设备号无效。
+    所以每个账号都必须配它自己客户端里那个真机号，不能共用、不能生成。"""
+    for k in storage:
+        if k.startswith("iCubeAuthInfo://icube-dc:"):
+            d = k.split(":")[-1]
+            if d.isdigit():
+                return d
+    return ""
 
 
 def at_valid(expired_at):
@@ -191,17 +207,23 @@ def main():
         print("[来源] %s" % p)
         if r.get("uid"):
             print("[账号] %s (UID %s)" % (r.get("nickname") or "-", r["uid"]))
+        if r.get("deviceId"):
+            print("[设备号] %s（真机号，签到必须带它）" % r["deviceId"])
+        else:
+            print("[设备号] ⚠️ 没找到 iCubeAuthInfo://icube-dc:* 键，该账号无法签到")
         if r.get("expiredAt"):
             live = at_valid(r["expiredAt"])
             print("[accessToken] %s，到期 %s" % ("✅ 未过期" if live else "⌛ 已过期", r["expiredAt"]))
         print("-" * 64)
         # 推荐写法：整串 TRAE_ACCOUNTS 直接粘进青龙/Actions，accessToken 一起给，
         # 省掉一次续期。只有 refreshToken 时续期会因"未绑定客户端"被拒（10101）。
+        # deviceId 是真机号：服务端按设备维度判重，缺它或换成合成号一律 9074。
         one = {k: v for k, v in (("name", r.get("nickname")), ("uid", r.get("uid")),
                                  ("accessToken", r.get("accessToken")),
-                                 ("refreshToken", r.get("refreshToken"))) if v}
+                                 ("refreshToken", r.get("refreshToken")),
+                                 ("deviceId", r.get("deviceId"))) if v}
         accts.append(one)
-        print("TRAE_ACCOUNTS（推荐，含 accessToken，省一次续期）:")
+        print("TRAE_ACCOUNTS（推荐，含 accessToken 与真机 deviceId）:")
         print(json.dumps([one], ensure_ascii=False))
         print("-" * 64)
         print("TRAE_REFRESH_TOKEN（旧写法，仅 refreshToken）:")
@@ -214,6 +236,14 @@ def main():
     if len(accts) > 1:
         print("\n多账号合并写法（一次粘进 TRAE_ACCOUNTS）:")
         print(json.dumps(accts, ensure_ascii=False, indent=2))
+        # 多账号最容易踩的坑：设备号必须两两不同，否则后签的会撞 9095/9074
+        ids = [a.get("deviceId") for a in accts if a.get("deviceId")]
+        if len(ids) != len(set(ids)):
+            print("\n⚠️ 有账号共用同一个设备号！服务端按设备维度判重，"
+                  "同一设备一天只能签一个账号，重复的账号签不上。")
+        missing = [a.get("name") or a.get("uid") for a in accts if not a.get("deviceId")]
+        if missing:
+            print("\n⚠️ 这些账号缺 deviceId，签到会一直 9074：%s" % "、".join(missing))
 
 if __name__ == "__main__":
     main()
