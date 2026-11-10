@@ -196,6 +196,35 @@ def dc_device_id(storage):
     return ''
 
 
+def dc_keypair(storage):
+    """从 storage.json 的 iCubeAuthInfo://icube-dc:<id> 键解出该设备完整身份：
+    {'device_id','private_key_pem','public_key_pem','machine_id'}。
+    设备密钥用 AES 加密存储（base64 以 dGM... 开头），decrypt_storage_value 已支持；
+    返回空 dict 表示这台机器没有可用的设备密钥对。"""
+    for k in storage:
+        if k.startswith('iCubeAuthInfo://icube-dc:'):
+            did = k.split(':')[-1]
+            if not did.isdigit():
+                continue
+            val = (storage.get(k) or '').strip()
+            if not val:
+                continue
+            try:
+                plain = decrypt_storage_value(val)
+            except Exception:
+                continue
+            try:
+                d, _ = json.JSONDecoder().raw_decode(plain)
+            except Exception:
+                continue
+            if isinstance(d, dict) and d.get('privateKeyPEM') and d.get('publicKeyPEM'):
+                return {'device_id': did,
+                        'private_key_pem': d['privateKeyPEM'],
+                        'public_key_pem': d['publicKeyPEM'],
+                        'machine_id': str(storage.get('telemetry.machineId') or '')}
+    return {}
+
+
 def find_storage_json():
     "“”自动探测桌面端 storage.json 路径（Windows / macOS / Linux），找不到返回 None。“”"
     home = os.path.expanduser('~')
@@ -218,15 +247,24 @@ def find_storage_json():
 
 
 def load_from_storage(storage_path):
-    """返回 (解密后的登录凭据, 客户端真实设备号)。"""
+    """返回 (解密后的登录凭据, 客户端真实设备号)。凭据里并入设备密钥对（若有），
+    供 build_account 一并带进账号，实现带设备签名的续期。"""
     with open(storage_path, 'r', encoding='utf-8') as fh:
         storage = json.load(fh)
+    kp = dc_keypair(storage)
     enc = (storage.get(STORAGE_KEY) or '').strip()
     if not enc:
         raise ValueError('storage.json 里找不到 %s' % STORAGE_KEY)
     if enc.startswith('{'):
-        return json.loads(enc), dc_device_id(storage)
-    return json.loads(decrypt_storage_value(enc)), dc_device_id(storage)
+        d = json.loads(enc)
+    else:
+        d = json.loads(decrypt_storage_value(enc))
+    d['deviceId'] = dc_device_id(storage) or d.get('deviceId', '')
+    if kp:
+        d['devicePrivateKeyPEM'] = kp['private_key_pem']
+        d['devicePublicKeyPEM'] = kp['public_key_pem']
+        d['deviceMachineId'] = kp['machine_id']
+    return d, dc_device_id(storage)
 
 
 # ══════════════════ 缓存文件 ══════════════════
@@ -462,12 +500,50 @@ def ug_headers(token, device_id):
 
 
 # ══════════════════ Token 工具 ══════════════════
-def refresh(refresh_token):
-    """用 refreshToken 换新 accessToken；Trae 会同时轮换 refreshToken。"""
-    body = json.dumps({'ClientID': ClientID, 'RefreshToken': refresh_token,
-                       'ClientSecret': '-', 'UserID': ''})
+def _device_signature(body, priv_pem):
+    """按桌面端 ZLe 协议，用设备 ECDSA P-256 私钥对续期请求签名，产出 DeviceProof。
+    cryptography 即脚本解 storage 时已依赖的库，这里复用同一套。"""
+    import hashlib as _hl
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+    nonce = os.urandom(16).hex()
+    ts = int(time.time())
+    material = '\n'.join(body + [str(ts), nonce]).encode('utf-8')
+    key = serialization.load_pem_private_key(priv_pem.encode('utf-8'), password=None)
+    sig = key.sign(material, ec.ECDSA(hashes.SHA256()))
+    return {'Timestamp': ts, 'Nonce': nonce, 'Signature': base64.b64encode(sig).decode('ascii')}
+
+
+def refresh(refresh_token, device=None):
+    """用 refreshToken 换新 accessToken；Trae 会同时轮换 refreshToken。
+
+    device 传入 {'device_id', 'private_key_pem', 'public_key_pem', 'machine_id', 'client_version'}
+    时，按桌面端协议附上 DeviceInfo + DeviceProof（设备签名）——这是续期不被
+    10101 拒绝的关键；无签名时退化为仅 ClientID+RefreshToken 的旧请求。"""
+    body = {'ClientID': ClientID, 'RefreshToken': refresh_token,
+            'ClientSecret': '-', 'UserID': ''}
+    if device and device.get('private_key_pem') and device.get('device_id'):
+        dev_id = device['device_id']
+        pub = device.get('public_key_pem') or ''
+        dkv = {'DeviceID': dev_id,
+               'MachineID': device.get('machine_id') or '',
+               'PlatformCode': 'IDE_PC',
+               'DeviceType': 'PC',
+               'DeviceName': 'Microsoft Windows',
+               'DeviceModel': '',
+               'ClientVersion': device.get('client_version') or IdeVersion,
+               'DevicePublicKey': pub,
+               'DeviceBrand': '',
+               'DeviceCPU': '',
+               'OSInfo': 'Windows',
+               'OSVersion': '10.0.19045'}
+        proof = _device_signature(['POST', '/cloudide/api/v3/trae/oauth/ExchangeToken',
+                                   ClientID, refresh_token], device['private_key_pem'])
+        body['DeviceInfo'] = dkv
+        body['DeviceProof'] = proof
+    payload = json.dumps(body)
     status, text = _post(EP_EXCHANGE, {'Content-Type': 'application/json',
-                                       'Accept': 'application/json', 'User-Agent': UA}, body)
+                                       'Accept': 'application/json', 'User-Agent': UA}, payload)
     if status >= 400 or status < 0:
         return None, None, 'refresh http=%s %s' % (status, text[:200])
     try:
@@ -486,11 +562,27 @@ def _jwt_exp(token):
         return 0
 
 
+def build_device_context(acc):
+    """从账号组装设备签名续期所需上下文；缺私钥/缺设备号返回 None（退化为无签名续期）。
+    优先取账号里的 devicePrivateKeyPEM/devicePublicKeyPEM，其次 storage 内置的密钥对。"""
+    priv = str(acc.get('devicePrivateKeyPEM') or acc.get('privateKeyPEM') or '').strip().replace('\\n', '\n')
+    pub = str(acc.get('devicePublicKeyPEM') or acc.get('publicKeyPEM') or '').strip().replace('\\n', '\n')
+    did = str(acc.get('_realDid') or acc.get('deviceId') or '').strip()
+    if not (priv.startswith('-----BEGIN') and did.isdigit() and len(did) == 16):
+        return None
+    return {'device_id': did,
+            'private_key_pem': priv,
+            'public_key_pem': pub,
+            'machine_id': str(acc.get('deviceMachineId') or '')}
+
+
 def ensure_token(acc, cache):
-    """accessToken 缺失时直接续期；返回 (ok, msg)。续期成功即回写缓存与账号文件。"""
+    """accessToken 缺失时直接续期；返回 (ok, msg)。续期成功即回写缓存与账号文件。
+    账号绑定了设备私钥时自动带设备签名（DeviceProof）续期，绕开 10101。"""
     if not acc.get('refreshToken'):
         return False, '无 refreshToken，无法刷新'
-    new_at, new_rt, msg = refresh(acc['refreshToken'])
+    dev = build_device_context(acc)
+    new_at, new_rt, msg = refresh(acc['refreshToken'], device=dev)
     if not new_at:
         return False, msg
     acc['accessToken'] = new_at
@@ -645,11 +737,19 @@ def pick(d, *candidates):
 
 
 def normalize(d, src, name='', real=''):
-    return {'accessToken': pick(d, 'accessToken', 'token', 'access_token'),
+    out = {'accessToken': pick(d, 'accessToken', 'token', 'access_token'),
             'refreshToken': pick(d, 'refreshToken', 'refresh_token'),
             'deviceId': pick(d, 'deviceId', 'device_id'),
             'uid': str(pick(d, 'uid', 'userId', 'user_id')),
             '_src': src, '_name': name, '_realDid': real}
+    # 设备签名能力：可来自账号字段或 storage 内置密钥对
+    for k in ('devicePrivateKeyPEM', 'devicePublicKeyPEM', 'deviceMachineId'):
+        if d.get(k):
+            out[k] = d[k]
+    if real and out.get('devicePrivateKeyPEM') is None:
+        # storagePath 分支已把密钥对并进来（见 _storage_device_ctx）
+        pass
+    return out
 
 
 def build_account(raw, name):

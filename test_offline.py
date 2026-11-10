@@ -147,6 +147,44 @@ def test_status_flags():
     assert (checked_in, did, credits, enable) == (False, True, 100, True)
 
 
+def test_device_signature_context():
+    """设备签名续期：有私钥+真机号时能组装出可用 context，缺任何一样则退化为 None
+    （走无签名续期，不炸）。DeviceProof 必须包含客户端要求的 Timestamp/Nonce/Signature。"""
+    priv = '-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n-----END PRIVATE KEY-----'
+    pub = '-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PUBLIC KEY-----'
+
+    # 缺私钥 → None（退化为无签名续期，不崩）
+    acc_no = {'deviceId': '3753091561689896', '_realDid': '3753091561689896',
+              'devicePublicKeyPEM': pub}
+    assert ci.build_device_context(acc_no) is None
+
+    # 私钥 + 真机号都在 → 有完整 context
+    acc_ok = {'deviceId': '3753091561689896', '_realDid': '3753091561689896',
+              'devicePrivateKeyPEM': priv,
+              'devicePublicKeyPEM': pub,
+              'deviceMachineId': 'a56b1c94'}
+    ctx = ci.build_device_context(acc_ok)
+    assert ctx and ctx['device_id'] == '3753091561689896'
+    assert ctx['private_key_pem'] == priv
+
+    # 私钥里含字面 \n 转义也要能还原成真实换行
+    acc_esc = {'deviceId': '3753091561689896', '_realDid': '3753091561689896',
+               'devicePrivateKeyPEM': priv.replace('\n', '\\n'),
+               'devicePublicKeyPEM': pub, 'deviceMachineId': 'm'}
+    assert ci.build_device_context(acc_esc)['private_key_pem'] == priv
+
+
+def test_dc_keypair_from_storage():
+    """load_from_storage 应从 icube-dc 键一并解出设备密钥对，供账号做签名续期。
+    无密钥的会拿到空 deviceId/密钥而不抛错。"""
+    st = {'telemetry.machineId': 'mm',
+          'iCubeAuthInfo://icube.cloudide': 'x',
+          'iCubeAuthInfo://icube-dc:2803108645440825': 'base64!'}
+    kp = ci.dc_keypair(st)   # 加密串无效 → 解不出 → 空 dict
+    assert kp == {}
+    assert ci.dc_device_id(st) == '2803108645440825'
+
+
 if __name__ == '__main__':
     n = 0
     for name, fn in sorted(globals().items()):
