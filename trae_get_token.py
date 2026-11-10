@@ -157,13 +157,15 @@ def extract(path):
     at = pick("token") or (re.search(r'"token"\s*:\s*"([^"]+)"', txt) or [None, None])[1]
     uid = str(pick("userId") or (re.search(r'"userId"\s*:\s*"(\d+)"', txt) or [None, ""])[1] or "")
     nick = pick("username")
+    kp = device_keypair(s)
     return {"refreshToken": rt,
             "accessToken": at,
             "uid": uid,
             "nickname": nick,
             "deviceId": real_device_id(s),
             "expiredAt": d.get("expiredAt") or "",
-            "refreshExpiredAt": d.get("refreshExpiredAt") or ""}
+            "refreshExpiredAt": d.get("refreshExpiredAt") or "",
+            **kp}
 
 
 def real_device_id(storage):
@@ -179,6 +181,36 @@ def real_device_id(storage):
             if d.isdigit():
                 return d
     return ""
+
+
+def device_keypair(storage):
+    """解出该设备在 Trae 服务端登记过的完整身份：私钥 + 公钥 + 机器 ID。
+
+    设备密钥用 AES 加密存在 iCubeAuthInfo://icube-dc:<id> 键里（与登录凭据同一套
+    AES 解密）。拿到这套才能做“带设备签名”的 token 续期（DeviceProof）——否则
+    续期会被服务端拒成 10101「refresh token is not matched to the client」。
+    返回 dict：{devicePrivateKeyPEM, devicePublicKeyPEM, deviceMachineId}；
+    解不出返回空 dict（不影响普通 token 提取）。"""
+    def dc_pub(val):
+        try:
+            txt = decrypt_storage_value(val).decode("utf-8", "replace")
+            d, _ = json.JSONDecoder().raw_decode(txt)
+        except Exception:
+            return {}
+        if isinstance(d, dict) and d.get("privateKeyPEM") and d.get("publicKeyPEM"):
+            return {"devicePrivateKeyPEM": d["privateKeyPEM"],
+                    "devicePublicKeyPEM": d["publicKeyPEM"],
+                    "deviceMachineId": str(storage.get("telemetry.machineId") or "")}
+        return {}
+    for k in storage:
+        if k.startswith("iCubeAuthInfo://icube-dc:"):
+            val = (storage.get(k) or "").strip()
+            if not val:
+                continue
+            kp = dc_pub(val)
+            if kp:
+                return kp
+    return {}
 
 
 def at_valid(expired_at):
@@ -218,13 +250,21 @@ def main():
         # 推荐写法：整串 TRAE_ACCOUNTS 直接粘进青龙/Actions，accessToken 一起给，
         # 省掉一次续期。只有 refreshToken 时续期会因"未绑定客户端"被拒（10101）。
         # deviceId 是真机号：服务端按设备维度判重，缺它或换成合成号一律 9074。
+        # devicePrivateKeyPEM + devicePublicKeyPEM 用于带设备签名续期(DeviceProof)，
+        # 有了它续期才不会被 10101 拒；有则自动带上。
         one = {k: v for k, v in (("name", r.get("nickname")), ("uid", r.get("uid")),
                                  ("accessToken", r.get("accessToken")),
                                  ("refreshToken", r.get("refreshToken")),
-                                 ("deviceId", r.get("deviceId"))) if v}
+                                 ("deviceId", r.get("deviceId")),
+                                 ("devicePrivateKeyPEM", r.get("devicePrivateKeyPEM")),
+                                 ("devicePublicKeyPEM", r.get("devicePublicKeyPEM")),
+                                 ("deviceMachineId", r.get("deviceMachineId"))) if v}
         accts.append(one)
-        print("TRAE_ACCOUNTS（推荐，含 accessToken 与真机 deviceId）:")
+        print("TRAE_ACCOUNTS（推荐，含 accessToken、真机 deviceId 与设备签名密钥）:")
         print(json.dumps([one], ensure_ascii=False))
+        if not r.get("devicePrivateKeyPEM"):
+            print("⚠️  未解出设备密钥对 —— 续期仍只发 ClientID+RefreshToken，"
+                  "可能被 10101 拒；若本机 icube-dc 键缺失将无法签名续期。")
         print("-" * 64)
         print("TRAE_REFRESH_TOKEN（旧写法，仅 refreshToken）:")
         print("TRAE_REFRESH_TOKEN = %s" % r.get("refreshToken"))

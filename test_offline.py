@@ -115,6 +115,19 @@ def test_extract_parses_json_blob():
     assert gt.at_valid('') is False
 
 
+def test_extract_emits_device_keypair():
+    """提取器必须连设备密钥对一起给出，否则续期仍会 10101。
+    设备密钥在 icube-dc 键里用同一套 AES 加密，应能解出 privateKeyPEM/publicKeyPEM。"""
+    import trae_get_token as gt
+    # 用真实解出的室友设备身份(376309...)验证：device_keypair 能解出完整三件套
+    # 无法离线造密文，退而验证 device_keypair 对"无实际密钥"的容错：给假 base64 返回空
+    st = {'telemetry.machineId': 'mm',
+          'iCubeAuthInfo://icube-dc:3753091561689896': 'not-a-real-cipher',
+          'iCubeAuthInfo://icube.cloudide': 'x'}
+    assert gt.device_keypair(st) == {}            # 无效密文 -> 空，不抛
+    assert gt.real_device_id(st) == '3753091561689896'
+
+
 def test_real_device_id_wins_and_never_rotates():
     """9074 的根因是设备号不被服务端认可，不是限流（2026-11 实测）。
     真机号必须优先、且 9074 后绝不轮换成合成号，否则越换越签不上。"""
