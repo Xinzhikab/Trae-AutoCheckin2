@@ -19,7 +19,7 @@ TRAE_ACCOUNTS            多账号 JSON 数组（推荐，与签到脚本共用�
 TRAE_REFRESH_TOKEN       旧部署兼容：refreshToken（也支持 _2~_N 后缀多账号）
   WECHAT_WEBHOOK           企业微信机器人 webhook 地址（可选，用于推送）
   TRAE_TOKEN_CACHE         缓存文件路径（可选，默认 /ql/data/config/ 或脚本同目录）
-  TRAE_SAVE_DIR            账号 JSON 所在目录（可选，用于回写轮换后的 refreshToken）
+  TRAE_ACCOUNT_DIR         账号 JSON 所在目录（可选，用于回写轮换后的 refreshToken）
 
 🔑 如何获取 refreshToken（新手必看，两步搞定）
   方式一：一键提取（推荐 · 免抓包）
@@ -46,15 +46,15 @@ TRAE_REFRESH_TOKEN       旧部署兼容：refreshToken（也支持 _2~_N 后缀
 ────────────────────────────────────────────────────────────
 """
 
-import base64, datetime, hashlib, json, os, sys, time, urllib.request, urllib.error
+import base64, datetime, hashlib, json, os, platform, sys, time, urllib.request, urllib.error
 
 UgHost = 'https://api.trae.cn'
 OAuthHost = 'https://api.trae.com.cn'
 ClientID = 'en1oxy7wnw8j9n'
 EP_EXCHANGE = OAuthHost + '/cloudide/api/v3/trae/oauth/ExchangeToken'
 EP_ENTITLE = UgHost + '/trae/api/v2/pay/user_current_entitlement_list'
-UA = 'Trae/1.0'
-AUTH_FAIL_CODES = (1001, 1002)
+UA = 'Trae/1.107.1'   # 与桌面端一致：UA 不匹配会被风控按异常客户端处理
+AUTH_FAIL_CODES = (1001, 1002, 401, 403)
 
 
 # ══════════════════ 缓存文件 ══════════════════
@@ -91,15 +91,23 @@ def save_cache(cache):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+        if os.name == 'posix':          # 缓存里是明文 token，同签到脚本收到 0600
+            try:
+                os.chmod(path, 0o600)
+            except Exception:
+                pass
     except Exception as e:
         print('⚠️  [缓存] 写入失败:', e)
 
 
-# ══════════════════ HTTP ══════════════════
+# ══════════════════ HTTP（强制直连，与签到脚本一致） ══════════════════
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _post(url, headers, body=''):
     req = urllib.request.Request(url, data=body.encode('utf-8'), headers=headers, method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _opener.open(req, timeout=30) as resp:
             return resp.status, resp.read().decode('utf-8', errors='replace')
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode('utf-8', errors='replace')
@@ -109,7 +117,8 @@ def _post(url, headers, body=''):
 
 def ug_headers(token, device_id):
     return {'Authorization': 'Cloud-IDE-JWT ' + token, 'X-User-Region': 'cn', 'x-device-id': device_id,
-            'User-Agent': 'TraeCreditMonitor/1.0', 'Content-Type': 'application/json'}
+            'User-Agent': UA, 'Content-Type': 'application/json',
+            'x-app-version': '1.107.1', 'x-device-type': platform.system() or 'Windows'}
 
 
 # ══════════════════ Token 工具 ══════════════════
@@ -144,8 +153,11 @@ def _jwt_uid(token):
 
 
 def stable_device_id(seed):
-    h = hashlib.md5(('trae:' + seed).encode('utf-8')).hexdigest()
-    return str(int(h[:15], 16))[:16].rjust(16, '0')
+    """与签到脚本同一算法、同一颗种子，两个脚本看到的才是同一台设备。
+    早先这里用 md5(refreshToken) 生成，续期一次设备号就换一个，风控眼里
+    等于"同一账号的设备不停更换"。"""
+    h = hashlib.sha256(seed.encode('utf-8')).digest()
+    return str(int.from_bytes(h[:8], 'big') % (10 ** 16 - 10 ** 15) + 10 ** 15)
 
 
 def persist_refresh_token(uid, new_rt, seed_rt):
@@ -176,9 +188,8 @@ def persist_refresh_token(uid, new_rt, seed_rt):
             return
 
 
-def get_token(idx, rt_env, did_env, cache, force_refresh=False, at_env=''):
-    key = str(idx)
-    did = did_env or stable_device_id(rt_env)
+def get_token(key, rt_env, did_env, cache, force_refresh=False, at_env=''):
+    did = did_env or stable_device_id(key or rt_env)
     ent = cache.get(key) or {}
     at = ent.get('accessToken')
     rt_cache = ent.get('refreshToken')
@@ -215,6 +226,8 @@ def get_token(idx, rt_env, did_env, cache, force_refresh=False, at_env=''):
 
 # ══════════════════ 积分接口 ══════════════════
 def credits_summary(token, device_id, tries=3):
+    """查询积分：与签到脚本同一套解析 —— 实测该接口把 usage_summary 放在根级，
+    逆向资料里是 data 包装，两种都认；拿不到总额再按 entitlement 包求和兜底。"""
     for attempt in range(tries):
         status, text = _post(EP_ENTITLE, ug_headers(token, device_id), json.dumps({'require_usage': True, 'full_data': True}))
         if status < 0:
@@ -222,14 +235,25 @@ def credits_summary(token, device_id, tries=3):
             continue
         try:
             b = json.loads(text)
-            s = b.get('usage_summary', {})
-            total = s.get('total_amount')
-            used = s.get('consumed_amount')
-            remain = round(total - used, 2) if (total is not None and used is not None) else None
-            return {'total': total, 'used': used, 'remain': remain, 'code': b.get('code', -1)}
         except Exception:
             time.sleep(4 + attempt * 4)
             continue
+        root = b.get('data') or b
+        s = root.get('usage_summary') or {}
+        total, used = s.get('total_amount'), s.get('consumed_amount')
+        if total is not None and used is not None:
+            return {'total': total, 'used': used, 'remain': round(total - used, 2), 'code': b.get('code', -1)}
+        try:
+            packs = root.get('user_entitlement_pack_list') or []
+            t = sum(float(((p.get('entitlement_base_info') or {}).get('quota') or {}).get('credits_limit') or 0) for p in packs)
+            u = sum(float((p.get('usage') or {}).get('credits_amount') or 0) for p in packs)
+            if t > 0:
+                return {'total': t, 'used': u, 'remain': round(t - u, 2), 'code': b.get('code', -1)}
+        except Exception:
+            pass
+        if b.get('code') in AUTH_FAIL_CODES:
+            return {'total': None, 'used': None, 'remain': None, 'code': b.get('code')}
+        time.sleep(4 + attempt * 4)
     return None
 
 
@@ -262,8 +286,16 @@ def bj():
 
 
 # ══════════════════ 账号选择 ══════════════════
+def acct_key(uid, name):
+    """与签到脚本 _acct_key 完全一致：uid > name > 'default'。
+    两个脚本共用同一份 .trae_token_cache.json，键不一致就等于各存各的，
+    轮换链会分叉 —— 那份 refreshToken 谁先用谁把对方刷失效。"""
+    return (str(uid or '').strip() or str(name or '').strip() or 'default')
+
+
 def load_accounts():
-    """优先读 TRAE_ACCOUNTS（与签到脚本共用同一个变量），否则退回旧变量。"""
+    """优先读 TRAE_ACCOUNTS（与签到脚本共用同一个变量），否则退回旧变量。
+    返回 (key, rt, did, label, at)；key 与签到脚本 _acct_key 同规则：uid > name > default。"""
     raw = os.environ.get('TRAE_ACCOUNTS', '').strip()
     if raw:
         data = json.loads(raw)
@@ -272,15 +304,16 @@ def load_accounts():
         only = os.environ.get('TRAE_ONLY', '').strip()
         accounts = []
         for i, a in enumerate(data):
-            rt = a.get('refreshToken', '').strip()
+            rt = (a.get('refreshToken') or '').strip()
             if not rt:
                 continue
             idx = i + 1
-            label = a.get('name') or a.get('uid') or '账号%d' % idx
+            label = (a.get('name') or a.get('uid') or '账号%d' % idx)
+            key = acct_key(a.get('uid'), a.get('name') or '账号%d' % idx)
             if only and only not in (str(idx), str(a.get('uid', '')), label):
                 continue
-            at = a.get('accessToken', '').strip()
-            accounts.append((idx, rt, a.get('deviceId', '').strip(), label, at))
+            at = (a.get('accessToken') or '').strip()
+            accounts.append((key, rt, (a.get('deviceId') or '').strip(), label, at))
         if accounts:
             return accounts
     only = os.environ.get('TRAE_ONLY', '').strip()
@@ -292,20 +325,17 @@ def load_accounts():
             continue
         did = os.environ.get('TRAE_DEVICE_ID' if i == 1 else 'TRAE_DEVICE_ID_%d' % i, '').strip()
         at = os.environ.get('TRAE_ACCESS_TOKEN' if i == 1 else 'TRAE_ACCESS_TOKEN_%d' % i, '').strip()
-        label = '账号%d' % i
-        if only and only not in (str(i), label):
+        uid = os.environ.get('TRAE_UID' if i == 1 else 'TRAE_UID_%d' % i, '').strip()
+        label = os.environ.get('TRAE_NAME' if i == 1 else 'TRAE_NAME_%d' % i, '').strip() or '账号%d' % i
+        key = acct_key(uid, label)
+        if only and only not in (str(i), label, uid):
             continue
-        accounts.append((i, rt, did, label, at))
+        accounts.append((key, rt, did, label, at))
     return accounts
 
 
-def iter_accts():
-    for idx, rt, did, label, at in load_accounts():
-        yield idx, rt, did, label, at
-
-
 def main():
-    accts = list(iter_accts())
+    accts = load_accounts()
     if not accts:
         print('❌ 未找到账号配置（TRAE_ACCOUNTS 或 TRAE_REFRESH_TOKEN）')
         sys.exit(1)
@@ -317,15 +347,14 @@ def main():
     cache = load_cache()
     ok, fail = [], []
     out = ['📊 Trae 积分监控', '🕒 ' + bj()]
-    for i, (idx, rt, did, label, at_env) in enumerate(accts):
-        name = label if label else '账号%d' % idx
-        token, did, new_rt, err = get_token(idx, rt, did, cache, at_env=at_env)
+    for i, (key, rt, did, name, at_env) in enumerate(accts):
+        token, did, new_rt, err = get_token(key, rt, did, cache, at_env=at_env)
         if not token:
             print('❌ [%s] 凭证续期失败: %s' % (name, err))
             fail.append(name + ' 凭证续期失败'); out.append('❌ %s：凭证续期失败' % name); continue
         cs = credits_summary(token, did)
         if cs and cs.get('code') in AUTH_FAIL_CODES:
-            token, did, new_rt, err = get_token(idx, rt, did, cache, force_refresh=True)
+            token, did, new_rt, err = get_token(key, rt, did, cache, force_refresh=True)
             cs = credits_summary(token, did) if token else None
         if not cs or cs.get('total') is None:
             print('❌ [%s] 查询失败' % name)

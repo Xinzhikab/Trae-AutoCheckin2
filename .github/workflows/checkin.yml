@@ -36,6 +36,10 @@ jobs:
           TRAE_JITTER: "1"
         run: python trae_checkin.py
 
+      - name: Offline self-check
+        if: always()
+        run: python test_offline.py
+
       - name: Notify on failure
         if: failure()
         run: echo "::warning::签到脚本执行失败，请检查 secrets 和日志"

@@ -164,6 +164,7 @@ export QYWX_TOKEN="你的企业微信机器人 key"  # 可选
 
 python trae_checkin.py          # 签到
 python trae_credit_monitor.py   # 查积分
+python test_offline.py          # 离线自检（不联网、不需要 token）
 ```
 
 ### 方式三：GitHub Actions（免费 · 无需服务器）
@@ -324,6 +325,7 @@ Trae-AutoCheckin/
 ├── trae_credit_monitor.py      # 📊 积分只读监控
 ├── trae_sms_login.py           # 📲 短信验证码登录换 Token
 ├── trae_get_token.py           # 🔑 refreshToken 一键提取（免抓包）
+├── test_offline.py             # ✅ 离线自检（不联网，验证解析与账号键一致性）
 ├── .gitignore                  # 🚫 运行时缓存与账号文件永不入库
 ├── LICENSE                     # 📄 MIT
 └── README.md                   # 📖 本文件

@@ -614,6 +614,10 @@ def pick_batch(pending):
         return pending          # 默认一轮全签，9074 自动换号兜底
     if pending and in_peak_hour():
         return pending        # 早窗容量最松，一轮把剩下的全签掉（账号间照常错峰）
+    try:
+        size = max(1, int(raw))
+    except ValueError:
+        size = 1              # 写错成非数字就按 1 个轮签，别让定时任务整轮崩掉
     start = bj_now().tm_hour % max(1, len(pending))
     return (pending[start:] + pending[:start])[:size]
 
@@ -634,9 +638,15 @@ def normalize(d, src, name='', real=''):
 
 
 def build_account(raw, name):
-    # 1) 明文 token 直给  2) 桌面端加密凭据串  3) 指定 storage.json 路径（带真实设备号）
+    # 1) 明文 token 直给  2) 只给 refreshToken（accessToken 后续自动续期换取）
+    # 3) 桌面端加密凭据串  4) 指定 storage.json 路径（带真实设备号）
     if raw.get('accessToken'):
         return normalize(raw, 'accounts.json(明文token)', name or raw.get('uid', name),
+                         str(raw.get('realDeviceId') or ''))
+    if raw.get('refreshToken'):
+        # 文档一直写着「可只给 refreshToken」，但这里早先直接抛错，
+        # 导致 TRAE_ACCOUNTS 里只填 refreshToken 的部署整批加载失败。
+        return normalize(raw, 'accounts.json(refreshToken)', name or raw.get('uid', name),
                          str(raw.get('realDeviceId') or ''))
     if raw.get('icubeAuth'):
         return normalize(json.loads(decrypt_storage_value(raw['icubeAuth'].strip())),
@@ -644,7 +654,7 @@ def build_account(raw, name):
     if raw.get('storagePath'):
         d, real = load_from_storage(raw['storagePath'])
         return normalize(d, raw['storagePath'], name, real)
-    raise ValueError('账号 %s 缺少 accessToken / icubeAuth / storagePath' % (name or '(未命名)'))
+    raise ValueError('账号 %s 缺少 accessToken / refreshToken / icubeAuth / storagePath' % (name or '(未命名)'))
 
 
 def from_env_only():
@@ -792,7 +802,7 @@ def claim_with_retry(acc, cache):
                 return False, code, rmsg, None
             continue
         if not is_rate(code, status):
-            return False, code, msg
+            return False, code, msg, None
         if attempt < tries:
             wait = random.randint(4, 9)
             print('⏳ [限流] 第%d次被限，%ds 后重试（或交给下轮 cron）...' % (attempt, wait))
@@ -892,6 +902,7 @@ def checkin_account(acc, cache):
         if not ok:
             result['status'] = 'token失效' if acc.get('refreshToken') else '无token'
             result['detail'] = msg
+            print('❌ [%s] %s: %s' % (name, result['status'], msg))
             return result
 
     acc['deviceId'] = device_id_for(acc, acc.get('deviceId', ''))
